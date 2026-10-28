@@ -114,8 +114,8 @@ jobs:
                 !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
           }
           function validatePlan(p, target) {
-            const stages = ['qa','preprod','production'];
-            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
                 new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
                 canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
                 !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
@@ -419,8 +419,8 @@ jobs:
                 !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
           }
           function validatePlan(p, target) {
-            const stages = ['qa','preprod','production'];
-            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
                 new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
                 canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
                 !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');

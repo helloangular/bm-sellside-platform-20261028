@@ -31,13 +31,13 @@ permissions:
   contents: write
   packages: read
 jobs:
-  qa:
-    name: qa (${{ matrix.environment }})
-    if: ${{ !failure() && !cancelled() && vars.HELIO_ENVIRONMENTS != '' && contains(fromJSON(vars.HELIO_ENVIRONMENTS).order, 'qa') && (inputs.helio_target_environment == '' || contains(fromJSON(vars.HELIO_ENVIRONMENTS).qa, inputs.helio_target_environment)) }}
+  int:
+    name: int (${{ matrix.environment }})
+    if: ${{ !failure() && !cancelled() && vars.HELIO_ENVIRONMENTS != '' && contains(fromJSON(vars.HELIO_ENVIRONMENTS).order, 'int') && (inputs.helio_target_environment == '' || contains(fromJSON(vars.HELIO_ENVIRONMENTS).int, inputs.helio_target_environment)) }}
     strategy:
       fail-fast: false
       matrix:
-        environment: ${{ inputs.helio_target_environment != '' && fromJSON(format('["{0}"]', inputs.helio_target_environment)) || fromJSON(vars.HELIO_ENVIRONMENTS).qa }}
+        environment: ${{ inputs.helio_target_environment != '' && fromJSON(format('["{0}"]', inputs.helio_target_environment)) || fromJSON(vars.HELIO_ENVIRONMENTS).int }}
     environment: ${{ matrix.environment }}
     runs-on: ${{ fromJSON(vars.HELIO_ENVIRONMENTS).runs_on[matrix.environment] }}
     concurrency:
@@ -77,8 +77,8 @@ jobs:
                 !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
           }
           function validatePlan(p, target) {
-            const stages = ['qa','preprod','production'];
-            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
                 new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
                 canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
                 !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
@@ -390,8 +390,624 @@ jobs:
                 !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
           }
           function validatePlan(p, target) {
-            const stages = ['qa','preprod','production'];
-            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
+                new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
+                canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
+                !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
+            const seen = new Set();
+            for (const stage of p.order) {
+              if (!Array.isArray(p[stage]) || p[stage].length > 100) fail('plan_invalid');
+              for (const e of p[stage]) {
+                if (!envOK(e) || seen.has(e)) fail('plan_invalid');
+                seen.add(e);
+                const labels = Array.isArray(p.runs_on[e]) ? p.runs_on[e] : [p.runs_on[e]];
+                if (!labels.length || labels.length > 20 || labels.some(v => typeof v !== 'string' || !/^[A-Za-z0-9_. -]{1,100}$/.test(v))) fail('plan_invalid');
+              }
+            }
+            if (!seen.size || seen.size > 256 || Object.keys(p).some(k => !['order','runs_on',...p.order].includes(k)) ||
+                Object.keys(p.runs_on).some(k => !seen.has(k))) fail('plan_invalid');
+            if (target && !seen.has(target)) fail('target_not_in_plan');
+            return p;
+          }
+          function validateArtifact(a) {
+            if (!a || Object.keys(a).sort().join(',') !== 'artifact_digest,artifact_uri,build_version' ||
+                !/^sha256:[a-f0-9]{64}$/.test(a.artifact_digest || '') ||
+                !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,500}@sha256:[a-f0-9]{64}$/.test(a.artifact_uri || '') ||
+                !a.artifact_uri.endsWith('@' + a.artifact_digest) ||
+                typeof a.build_version !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(a.build_version)) fail('artifact_invalid');
+            return a;
+          }
+          function path(s) { scopeOK(s); return '/repos/' + s.repository; }
+          function nameOK(n) { if (!/^(artifacts|build-intents|plans|intents|receipts|target-locks|promotions)\/[A-Za-z0-9/_-]{1,180}$/.test(n) || n.includes('..')) fail('record_name'); }
+          async function read(api, s, name, otherCommit = false) {
+            nameOK(name); let ref;
+            try { ref = await api('GET', path(s) + '/git/ref/tags/helio/catalog/' + name); }
+            catch (e) { if (e.status === 404) return null; throw e; }
+            if (ref?.object?.type !== 'tag' || !shaOK(ref.object.sha)) fail('record_ref');
+            const tag = await api('GET', path(s) + '/git/tags/' + ref.object.sha);
+            if (tag.sha !== ref.object.sha || tag.object?.type !== 'commit' || typeof tag.message !== 'string' || Buffer.byteLength(tag.message) > 100000) fail('record_ref');
+            let body; try { body = JSON.parse(tag.message); } catch { fail('record_json'); }
+            if (body.schema !== 'helio_catalog_artifact_v1' || body.repository !== s.repository || body.repository_id !== s.repository_id ||
+                body.name !== name || !shaOK(body.commit) || tag.object.sha !== body.commit ||
+                (!otherCommit && (body.commit !== s.commit || body.workflow_path !== s.workflow_path))) fail('record_scope');
+            if (!body.value || hash(body.value) !== body.digest) fail('record_digest');
+            return {value: body.value, ref_sha: ref.object.sha, commit: body.commit};
+          }
+          async function put(api, s, name, value, exclusive = false) {
+            const old = await read(api, s, name, name.startsWith('target-locks/'));
+            if (old) {
+              if (exclusive) fail(name.startsWith('target-locks/') ? 'target_locked' : 'build_uncertain');
+              if (canonical(old.value) !== canonical(value)) fail('record_conflict');
+              return old;
+            }
+            const body = {schema:'helio_catalog_artifact_v1',repository:s.repository,repository_id:s.repository_id,workflow_path:s.workflow_path,commit:s.commit,name,value,digest:hash(value)};
+            const tag = await api('POST', path(s) + '/git/tags', {tag:'helio/catalog/' + name,message:canonical(body),object:s.commit,type:'commit'});
+            if (!shaOK(tag.sha)) fail('record_ref');
+            try { await api('POST', path(s) + '/git/refs', {ref:'refs/tags/helio/catalog/' + name,sha:tag.sha}); }
+            catch (e) {
+              if (![409,422].includes(e.status)) throw e;
+              const winner = await read(api, s, name, name.startsWith('target-locks/'));
+              if (exclusive) fail(name.startsWith('target-locks/') ? 'target_locked' : 'build_uncertain');
+              if (!winner || canonical(winner.value) !== canonical(value)) fail('record_conflict');
+              return winner;
+            }
+            return {value,ref_sha:tag.sha,commit:s.commit};
+          }
+          const execution = s => ({run_id:s.run_id,run_attempt:s.run_attempt,commit:s.commit});
+          const artifactName = s => 'artifacts/' + hash(s.workflow_path) + '/' + s.commit;
+          const buildIntentName = s => 'build-intents/' + hash(s.workflow_path) + '/' + s.commit;
+          const planName = s => 'plans/' + s.run_id;
+          const targetKey = target => hash(target);
+          const scopedName = (kind,s,target) => `${kind}/${s.run_id}/${s.run_attempt}/${targetKey(target)}`;
+          const operationId = (s,target) => hash({...s,environment:target});
+          // Dagly profile extension (review 2026-09-26, F1/F3). A settings contract --
+          // the application's declared deployment-setting names and, per environment,
+          // their values plus expected_targets -- is validated and frozen with the plan,
+          // bound into each intent by digest, and refused on drift. Runtime and shell
+          // control names can never be settings. Without a contract (the reference
+          // callers) nothing here applies and records are unchanged.
+          const reservedNames = new Set(['TARGET_ENVIRONMENT','SELECTED_ENVIRONMENT','ARTIFACT_URI','ARTIFACT_DIGEST','BUILD_VERSION',
+            'OPERATION_ID','RESULT_FILE','WORK','PATH','HOME','IFS','SHELL','ENV','BASH_ENV','PS4','PWD','OLDPWD','CDPATH','TMPDIR',
+            'LANG','LC_ALL','DOCKER_CONFIG','DEPLOY_SETTINGS','DEPLOY_SETTINGS_KEYS','CATALOG_PLAN','EXPECTED_TARGETS','ADAPTER',
+            'IMAGE_REPOSITORY','PYTHONPATH','PYTHONHOME','NODE_OPTIONS','LD_PRELOAD','LD_LIBRARY_PATH']);
+          const reservedSetting = k => reservedNames.has(k) || (/^(GITHUB_|RUNNER_|ACTIONS_|HELIO_|BASH_|LD_|DYLD_|GIT_|GO_)/.test(k) && k !== 'GO_PIPELINE_NAME');
+          function validateContract(contract, plan) {
+            if (contract === undefined || contract === null) return null;
+            const keys = contract.keys;
+            if (!Array.isArray(keys) || keys.length > 200 || new Set(keys).size !== keys.length ||
+                keys.some(k => typeof k !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(k) || reservedSetting(k))) fail('settings_invalid');
+            const all = contract.settings;
+            if (!all || typeof all !== 'object' || Array.isArray(all)) fail('settings_invalid');
+            // Review 2026-10-15 S1: `predecessors`, when present, names the environments
+            // the source made this one depend on (its GoCD ancestor deploys), each in an
+            // earlier tier of this plan. It is frozen with the rest and drives the
+            // promotion prerequisite below.
+            const required = [...keys, 'expected_targets'], optional = ['predecessors'], frozen = {};
+            const stageIndex = e => plan.order.findIndex(stage => plan[stage].includes(e));
+            for (const stage of plan.order) for (const e of plan[stage]) {
+              const v = all[e];
+              if (!v || typeof v !== 'object' || Array.isArray(v)) fail('settings_missing');
+              const present = Object.keys(v);
+              if (required.some(k => !present.includes(k)) || present.some(k => !required.includes(k) && !optional.includes(k))) fail('settings_keys');
+              if (!Number.isSafeInteger(v.expected_targets) || v.expected_targets < 1 || v.expected_targets > 1000) fail('settings_invalid');
+              if (keys.some(k => typeof v[k] !== 'string' || Buffer.byteLength(v[k]) > 4000)) fail('settings_invalid');
+              if ('predecessors' in v) {
+                const ps = v.predecessors;
+                if (!Array.isArray(ps) || ps.length > 100 || new Set(ps).size !== ps.length ||
+                    ps.some(x => !envOK(x) || stageIndex(x) < 0 || stageIndex(x) >= stageIndex(e))) fail('settings_invalid');
+              }
+              frozen[e] = v;
+            }
+            return frozen;
+          }
+          async function assertPlan(api,s,plan,target,contract) {
+            validatePlan(plan,target);
+            const retained = await read(api,s,planName(s));
+            if (!retained || canonical(retained.value.plan) !== canonical(plan)) fail('plan_drift');
+            const frozen = validateContract(contract, plan);
+            if ((frozen !== null || retained.value.settings !== undefined) &&
+                canonical(retained.value.settings) !== canonical(frozen)) fail('settings_drift');
+            return retained.value.settings;
+          }
+          async function resolve(api,s,plan,target,contract) {
+            scopeOK(s);validatePlan(plan,target);
+            const frozen = validateContract(contract, plan);
+            // Missing recovery artifact causes no mutation and never a build.
+            const prior = await read(api,s,artifactName(s));
+            if (target && !prior) fail('artifact_missing');
+            // A rerun reads the variables again. Settings changed since this run froze
+            // them are drift, and are reported as such rather than as a record conflict.
+            const retained = await read(api,s,planName(s));
+            if (retained && frozen !== null && canonical(retained.value.plan) === canonical(plan) &&
+                canonical(retained.value.settings) !== canonical(frozen)) fail('settings_drift');
+            await put(api,s,planName(s),frozen === null ? {plan} : {plan,settings:frozen});
+            if (prior) return {build_required:false,artifact:validateArtifact(prior.value.artifact)};
+            await put(api,s,buildIntentName(s),execution(s),true);
+            return {build_required:true};
+          }
+          async function publish(api,s,artifact) {
+            validateArtifact(artifact);
+            const intent = await read(api,s,buildIntentName(s));
+            if (!intent || canonical(intent.value) !== canonical(execution(s))) fail('build_owner');
+            const result = await put(api,s,artifactName(s),{artifact,builder:execution(s)});
+            return result.value.artifact;
+          }
+          async function unlock(api,s,target,operation) {
+            const name='target-locks/' + targetKey(target), lock=await read(api,s,name,true);
+            if (!lock) return;
+            if (lock.value.operation_id !== operation) fail('target_owner_changed');
+            // The identical GitHub concurrency group serializes release of this ref with
+            // the next target job. Never delete another execution's observed lock.
+            await api('DELETE',path(s) + '/git/refs/tags/helio/catalog/' + name);
+          }
+          // Dagly profile extension (review 2026-10-15, R2). A targeted run (the
+          // caller's helio_target_environment set) skips the earlier tiers' jobs, so
+          // nothing in the run proves the artifact passed them. complete records, per
+          // artifact and tier, that some environment of that tier verified the artifact
+          // (create-or-keep, so the first receipt wins and later ones are no conflict).
+          // prepare for a targeted deploy then distinguishes restoring from promoting:
+          // an artifact this environment already verified (a redeploy or a rollback)
+          // passes; a first deployment of the artifact into the environment requires,
+          // when the frozen settings declare the environment's predecessors (S1), a
+          // verified record in each of them, and otherwise a record for every earlier
+          // tier of the current plan; else it is refused with promotion_prerequisite.
+          // Normal fan-out keeps its ordering by construction.
+          const stageOf = (plan,target) => plan.order.find(stage => plan[stage].includes(target));
+          const promotionName = (artifact,stage) => 'promotions/' + hash(artifact.artifact_digest) + '/stage/' + stage;
+          const verifiedName = (artifact,target) => 'promotions/' + hash(artifact.artifact_digest) + '/env/' + targetKey(target);
+          async function ensure(api,s,name,value) {
+            const old = await read(api,s,name,true);
+            if (old) return old;
+            try { return await put(api,s,name,value); }
+            catch (e) { const won = await read(api,s,name,true); if (won) return won; throw e; }
+          }
+          async function assertPromoted(api,s,plan,target,artifact,settings) {
+            if (await read(api,s,verifiedName(artifact,target),true)) return;
+            const predecessors = settings && settings[target] && settings[target].predecessors;
+            if (Array.isArray(predecessors)) {
+              for (const env of predecessors) if (!(await read(api,s,verifiedName(artifact,env),true))) fail('promotion_prerequisite');
+              return;
+            }
+            const stage = stageOf(plan,target);
+            for (const earlier of plan.order.slice(0, plan.order.indexOf(stage))) {
+              if (!(await read(api,s,promotionName(artifact,earlier),true))) fail('promotion_prerequisite');
+            }
+          }
+          // S3: the receipt is the proof; the promotion records derive from it, so a
+          // replay that finds a receipt rebuilds any record a crash left out.
+          async function recordPromotion(api,s,plan,target,value) {
+            const promotion={artifact_digest:value.artifact.artifact_digest,stage:stageOf(plan,target),environment:target,operation_id:value.operation_id,
+              run_id:value.run_id,run_attempt:value.run_attempt,commit:value.commit};
+            await ensure(api,s,promotionName(value.artifact,stageOf(plan,target)),promotion);
+            await ensure(api,s,verifiedName(value.artifact,target),promotion);
+          }
+          async function prepare(api,s,plan,target,selection,contract) {
+            if (!envOK(target) || (selection && selection !== target)) fail('target_scope');
+            const settings = await assertPlan(api,s,plan,target,contract);
+            const frozen = settings === undefined ? {} : {deploy_settings: canonical(settings[target])};
+            const record=await read(api,s,artifactName(s));if(!record)fail('artifact_missing');
+            const artifact=validateArtifact(record.value.artifact), id=operationId(s,target);
+            if (selection) await assertPromoted(api,s,plan,target,artifact,settings);
+            const receipt=await read(api,s,scopedName('receipts',s,target));
+            if(receipt){
+              if(receipt.value.operation_id!==id || canonical(receipt.value.artifact)!==canonical(artifact))fail('record_conflict');
+              await recordPromotion(api,s,plan,target,receipt.value);
+              const lock=await read(api,s,'target-locks/'+targetKey(target),true);
+              if(lock?.value.operation_id===id)await unlock(api,s,target,id);
+              return {deploy_required:false,artifact,operation_id:id,...frozen};
+            }
+            if(await read(api,s,scopedName('intents',s,target)))fail('deployment_uncertain');
+            const intent={...execution(s),environment:target,operation_id:id,artifact,plan_digest:hash(plan),
+              ...(settings === undefined ? {} : {settings_digest:hash(settings[target])})};
+            await put(api,s,'target-locks/'+targetKey(target),intent,true);
+            await put(api,s,scopedName('intents',s,target),intent);
+            return {deploy_required:true,artifact,operation_id:id,...frozen};
+          }
+          async function complete(api,s,plan,target,observed,contract) {
+            const settings = await assertPlan(api,s,plan,target,contract);
+            const intent=await read(api,s,scopedName('intents',s,target));
+            const lock=await read(api,s,'target-locks/'+targetKey(target),true);
+            if(!intent || !lock || lock.value.operation_id!==intent.value.operation_id)fail('target_owner_changed');
+            const value=intent.value;
+            if(settings !== undefined && value.settings_digest !== hash(settings[target]))fail('settings_drift');
+            if(observed?.operation_id!==value.operation_id || observed.environment!==target ||
+                observed.observed_artifact_digest!==value.artifact.artifact_digest)fail('deployment_verification');
+            await put(api,s,scopedName('receipts',s,target),{...value,observed_artifact_digest:observed.observed_artifact_digest});
+            await recordPromotion(api,s,plan,target,value);
+            await unlock(api,s,target,value.operation_id);
+            return value;
+          }
+          async function main({github,context,core},phase) {
+            const e=process.env;
+            const workflow=(e.GITHUB_WORKFLOW_REF||'').slice((e.GITHUB_REPOSITORY||'').length+1).split('@')[0];
+            const s={repository:e.GITHUB_REPOSITORY,repository_id:String(context.payload.repository.id),workflow_path:workflow,commit:e.GITHUB_SHA,run_id:e.GITHUB_RUN_ID,run_attempt:Number(e.GITHUB_RUN_ATTEMPT)};
+            const api=async(method,url,body)=> (await github.request(method+' '+url,{...body,request:{timeout:10000}})).data;
+            let p;try{p=JSON.parse(e.CATALOG_PLAN);}catch{fail('plan_invalid');}
+            const target=e.TARGET_ENVIRONMENT||'',selection=e.SELECTED_ENVIRONMENT||'';
+            let contract;
+            if(e.DEPLOY_SETTINGS_KEYS){try{contract={keys:JSON.parse(e.DEPLOY_SETTINGS_KEYS),settings:JSON.parse(e.DEPLOY_SETTINGS||'null')};}catch{fail('settings_invalid');}}
+            let result;
+            if(phase==='resolve')result=await resolve(api,s,p,selection,contract);
+            else if(phase==='publish'){
+              const artifact=JSON.parse(require('node:fs').readFileSync(e.RESULT_FILE,'utf8'));
+              result={artifact:await publish(api,s,artifact)};
+            } else if(phase==='prepare')result=await prepare(api,s,p,target,selection,contract);
+            else if(phase==='complete'){
+              const observed=JSON.parse(require('node:fs').readFileSync(e.RESULT_FILE,'utf8'));
+              result=await complete(api,s,p,target,observed,contract);
+            } else fail('phase_invalid');
+            for(const [key,value]of Object.entries(result||{}))core.setOutput(key,typeof value==='object'?canonical(value):String(value));
+            if(result.artifact)for(const [key,value]of Object.entries(result.artifact))core.setOutput(key,value);
+          }
+          module.exports={canonical,hash,validatePlan,validateArtifact,validateContract,resolve,publish,prepare,complete,main};
+
+          })(loaded);
+          await loaded.exports.main({github, context, core}, 'complete');
+        retries: 0
+  qa:
+    name: qa (${{ matrix.environment }})
+    needs:
+    - int
+    if: ${{ !failure() && !cancelled() && vars.HELIO_ENVIRONMENTS != '' && contains(fromJSON(vars.HELIO_ENVIRONMENTS).order, 'qa') && (inputs.helio_target_environment == '' || contains(fromJSON(vars.HELIO_ENVIRONMENTS).qa, inputs.helio_target_environment)) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ inputs.helio_target_environment != '' && fromJSON(format('["{0}"]', inputs.helio_target_environment)) || fromJSON(vars.HELIO_ENVIRONMENTS).qa }}
+    environment: ${{ matrix.environment }}
+    runs-on: ${{ fromJSON(vars.HELIO_ENVIRONMENTS).runs_on[matrix.environment] }}
+    concurrency:
+      group: helio-catalog-target-${{ matrix.environment }}
+      cancel-in-progress: false
+    env:
+      CATALOG_PLAN: ${{ vars.HELIO_ENVIRONMENTS }}
+      DEPLOY_SETTINGS: ${{ vars.HELIO_DEPLOY_SETTINGS }}
+      DEPLOY_SETTINGS_KEYS: ${{ inputs.deploy_settings_keys }}
+      TARGET_ENVIRONMENT: ${{ matrix.environment }}
+      SELECTED_ENVIRONMENT: ${{ inputs.helio_target_environment }}
+    steps:
+    - name: Prepare durable catalog state
+      id: prepare
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+      with:
+        script: |
+          const loaded = {exports: {}};
+          (function(module) {
+          'use strict';
+          // Embedded verbatim in pinned reusable workflows by generate.py. No fetch/eval
+          // of runtime code, no secret data in durable records, no force-updated refs.
+          const crypto = require('node:crypto');
+          const fail = code => { throw Error('catalog_' + code); };
+          function canonical(x) {
+            if (Array.isArray(x)) return '[' + x.map(canonical).join(',') + ']';
+            if (x && typeof x === 'object') return '{' + Object.keys(x).sort().map(k => JSON.stringify(k) + ':' + canonical(x[k])).join(',') + '}';
+            return JSON.stringify(x);
+          }
+          const hash = x => crypto.createHash('sha256').update(canonical(x)).digest('hex');
+          const shaOK = x => typeof x === 'string' && /^[a-f0-9]{40}$/.test(x);
+          const envOK = x => typeof x === 'string' && /^[a-z0-9][a-z0-9._-]{0,62}$/.test(x) && !x.includes('..');
+          function scopeOK(s) {
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(s.repository || '') ||
+                !/^[1-9][0-9]{0,19}$/.test(s.repository_id || '') || !shaOK(s.commit) ||
+                !/^[1-9][0-9]{0,19}$/.test(s.run_id || '') || !/^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(s.workflow_path || '') ||
+                !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
+          }
+          function validatePlan(p, target) {
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
+                new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
+                canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
+                !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
+            const seen = new Set();
+            for (const stage of p.order) {
+              if (!Array.isArray(p[stage]) || p[stage].length > 100) fail('plan_invalid');
+              for (const e of p[stage]) {
+                if (!envOK(e) || seen.has(e)) fail('plan_invalid');
+                seen.add(e);
+                const labels = Array.isArray(p.runs_on[e]) ? p.runs_on[e] : [p.runs_on[e]];
+                if (!labels.length || labels.length > 20 || labels.some(v => typeof v !== 'string' || !/^[A-Za-z0-9_. -]{1,100}$/.test(v))) fail('plan_invalid');
+              }
+            }
+            if (!seen.size || seen.size > 256 || Object.keys(p).some(k => !['order','runs_on',...p.order].includes(k)) ||
+                Object.keys(p.runs_on).some(k => !seen.has(k))) fail('plan_invalid');
+            if (target && !seen.has(target)) fail('target_not_in_plan');
+            return p;
+          }
+          function validateArtifact(a) {
+            if (!a || Object.keys(a).sort().join(',') !== 'artifact_digest,artifact_uri,build_version' ||
+                !/^sha256:[a-f0-9]{64}$/.test(a.artifact_digest || '') ||
+                !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,500}@sha256:[a-f0-9]{64}$/.test(a.artifact_uri || '') ||
+                !a.artifact_uri.endsWith('@' + a.artifact_digest) ||
+                typeof a.build_version !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(a.build_version)) fail('artifact_invalid');
+            return a;
+          }
+          function path(s) { scopeOK(s); return '/repos/' + s.repository; }
+          function nameOK(n) { if (!/^(artifacts|build-intents|plans|intents|receipts|target-locks|promotions)\/[A-Za-z0-9/_-]{1,180}$/.test(n) || n.includes('..')) fail('record_name'); }
+          async function read(api, s, name, otherCommit = false) {
+            nameOK(name); let ref;
+            try { ref = await api('GET', path(s) + '/git/ref/tags/helio/catalog/' + name); }
+            catch (e) { if (e.status === 404) return null; throw e; }
+            if (ref?.object?.type !== 'tag' || !shaOK(ref.object.sha)) fail('record_ref');
+            const tag = await api('GET', path(s) + '/git/tags/' + ref.object.sha);
+            if (tag.sha !== ref.object.sha || tag.object?.type !== 'commit' || typeof tag.message !== 'string' || Buffer.byteLength(tag.message) > 100000) fail('record_ref');
+            let body; try { body = JSON.parse(tag.message); } catch { fail('record_json'); }
+            if (body.schema !== 'helio_catalog_artifact_v1' || body.repository !== s.repository || body.repository_id !== s.repository_id ||
+                body.name !== name || !shaOK(body.commit) || tag.object.sha !== body.commit ||
+                (!otherCommit && (body.commit !== s.commit || body.workflow_path !== s.workflow_path))) fail('record_scope');
+            if (!body.value || hash(body.value) !== body.digest) fail('record_digest');
+            return {value: body.value, ref_sha: ref.object.sha, commit: body.commit};
+          }
+          async function put(api, s, name, value, exclusive = false) {
+            const old = await read(api, s, name, name.startsWith('target-locks/'));
+            if (old) {
+              if (exclusive) fail(name.startsWith('target-locks/') ? 'target_locked' : 'build_uncertain');
+              if (canonical(old.value) !== canonical(value)) fail('record_conflict');
+              return old;
+            }
+            const body = {schema:'helio_catalog_artifact_v1',repository:s.repository,repository_id:s.repository_id,workflow_path:s.workflow_path,commit:s.commit,name,value,digest:hash(value)};
+            const tag = await api('POST', path(s) + '/git/tags', {tag:'helio/catalog/' + name,message:canonical(body),object:s.commit,type:'commit'});
+            if (!shaOK(tag.sha)) fail('record_ref');
+            try { await api('POST', path(s) + '/git/refs', {ref:'refs/tags/helio/catalog/' + name,sha:tag.sha}); }
+            catch (e) {
+              if (![409,422].includes(e.status)) throw e;
+              const winner = await read(api, s, name, name.startsWith('target-locks/'));
+              if (exclusive) fail(name.startsWith('target-locks/') ? 'target_locked' : 'build_uncertain');
+              if (!winner || canonical(winner.value) !== canonical(value)) fail('record_conflict');
+              return winner;
+            }
+            return {value,ref_sha:tag.sha,commit:s.commit};
+          }
+          const execution = s => ({run_id:s.run_id,run_attempt:s.run_attempt,commit:s.commit});
+          const artifactName = s => 'artifacts/' + hash(s.workflow_path) + '/' + s.commit;
+          const buildIntentName = s => 'build-intents/' + hash(s.workflow_path) + '/' + s.commit;
+          const planName = s => 'plans/' + s.run_id;
+          const targetKey = target => hash(target);
+          const scopedName = (kind,s,target) => `${kind}/${s.run_id}/${s.run_attempt}/${targetKey(target)}`;
+          const operationId = (s,target) => hash({...s,environment:target});
+          // Dagly profile extension (review 2026-09-26, F1/F3). A settings contract --
+          // the application's declared deployment-setting names and, per environment,
+          // their values plus expected_targets -- is validated and frozen with the plan,
+          // bound into each intent by digest, and refused on drift. Runtime and shell
+          // control names can never be settings. Without a contract (the reference
+          // callers) nothing here applies and records are unchanged.
+          const reservedNames = new Set(['TARGET_ENVIRONMENT','SELECTED_ENVIRONMENT','ARTIFACT_URI','ARTIFACT_DIGEST','BUILD_VERSION',
+            'OPERATION_ID','RESULT_FILE','WORK','PATH','HOME','IFS','SHELL','ENV','BASH_ENV','PS4','PWD','OLDPWD','CDPATH','TMPDIR',
+            'LANG','LC_ALL','DOCKER_CONFIG','DEPLOY_SETTINGS','DEPLOY_SETTINGS_KEYS','CATALOG_PLAN','EXPECTED_TARGETS','ADAPTER',
+            'IMAGE_REPOSITORY','PYTHONPATH','PYTHONHOME','NODE_OPTIONS','LD_PRELOAD','LD_LIBRARY_PATH']);
+          const reservedSetting = k => reservedNames.has(k) || (/^(GITHUB_|RUNNER_|ACTIONS_|HELIO_|BASH_|LD_|DYLD_|GIT_|GO_)/.test(k) && k !== 'GO_PIPELINE_NAME');
+          function validateContract(contract, plan) {
+            if (contract === undefined || contract === null) return null;
+            const keys = contract.keys;
+            if (!Array.isArray(keys) || keys.length > 200 || new Set(keys).size !== keys.length ||
+                keys.some(k => typeof k !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(k) || reservedSetting(k))) fail('settings_invalid');
+            const all = contract.settings;
+            if (!all || typeof all !== 'object' || Array.isArray(all)) fail('settings_invalid');
+            // Review 2026-10-15 S1: `predecessors`, when present, names the environments
+            // the source made this one depend on (its GoCD ancestor deploys), each in an
+            // earlier tier of this plan. It is frozen with the rest and drives the
+            // promotion prerequisite below.
+            const required = [...keys, 'expected_targets'], optional = ['predecessors'], frozen = {};
+            const stageIndex = e => plan.order.findIndex(stage => plan[stage].includes(e));
+            for (const stage of plan.order) for (const e of plan[stage]) {
+              const v = all[e];
+              if (!v || typeof v !== 'object' || Array.isArray(v)) fail('settings_missing');
+              const present = Object.keys(v);
+              if (required.some(k => !present.includes(k)) || present.some(k => !required.includes(k) && !optional.includes(k))) fail('settings_keys');
+              if (!Number.isSafeInteger(v.expected_targets) || v.expected_targets < 1 || v.expected_targets > 1000) fail('settings_invalid');
+              if (keys.some(k => typeof v[k] !== 'string' || Buffer.byteLength(v[k]) > 4000)) fail('settings_invalid');
+              if ('predecessors' in v) {
+                const ps = v.predecessors;
+                if (!Array.isArray(ps) || ps.length > 100 || new Set(ps).size !== ps.length ||
+                    ps.some(x => !envOK(x) || stageIndex(x) < 0 || stageIndex(x) >= stageIndex(e))) fail('settings_invalid');
+              }
+              frozen[e] = v;
+            }
+            return frozen;
+          }
+          async function assertPlan(api,s,plan,target,contract) {
+            validatePlan(plan,target);
+            const retained = await read(api,s,planName(s));
+            if (!retained || canonical(retained.value.plan) !== canonical(plan)) fail('plan_drift');
+            const frozen = validateContract(contract, plan);
+            if ((frozen !== null || retained.value.settings !== undefined) &&
+                canonical(retained.value.settings) !== canonical(frozen)) fail('settings_drift');
+            return retained.value.settings;
+          }
+          async function resolve(api,s,plan,target,contract) {
+            scopeOK(s);validatePlan(plan,target);
+            const frozen = validateContract(contract, plan);
+            // Missing recovery artifact causes no mutation and never a build.
+            const prior = await read(api,s,artifactName(s));
+            if (target && !prior) fail('artifact_missing');
+            // A rerun reads the variables again. Settings changed since this run froze
+            // them are drift, and are reported as such rather than as a record conflict.
+            const retained = await read(api,s,planName(s));
+            if (retained && frozen !== null && canonical(retained.value.plan) === canonical(plan) &&
+                canonical(retained.value.settings) !== canonical(frozen)) fail('settings_drift');
+            await put(api,s,planName(s),frozen === null ? {plan} : {plan,settings:frozen});
+            if (prior) return {build_required:false,artifact:validateArtifact(prior.value.artifact)};
+            await put(api,s,buildIntentName(s),execution(s),true);
+            return {build_required:true};
+          }
+          async function publish(api,s,artifact) {
+            validateArtifact(artifact);
+            const intent = await read(api,s,buildIntentName(s));
+            if (!intent || canonical(intent.value) !== canonical(execution(s))) fail('build_owner');
+            const result = await put(api,s,artifactName(s),{artifact,builder:execution(s)});
+            return result.value.artifact;
+          }
+          async function unlock(api,s,target,operation) {
+            const name='target-locks/' + targetKey(target), lock=await read(api,s,name,true);
+            if (!lock) return;
+            if (lock.value.operation_id !== operation) fail('target_owner_changed');
+            // The identical GitHub concurrency group serializes release of this ref with
+            // the next target job. Never delete another execution's observed lock.
+            await api('DELETE',path(s) + '/git/refs/tags/helio/catalog/' + name);
+          }
+          // Dagly profile extension (review 2026-10-15, R2). A targeted run (the
+          // caller's helio_target_environment set) skips the earlier tiers' jobs, so
+          // nothing in the run proves the artifact passed them. complete records, per
+          // artifact and tier, that some environment of that tier verified the artifact
+          // (create-or-keep, so the first receipt wins and later ones are no conflict).
+          // prepare for a targeted deploy then distinguishes restoring from promoting:
+          // an artifact this environment already verified (a redeploy or a rollback)
+          // passes; a first deployment of the artifact into the environment requires,
+          // when the frozen settings declare the environment's predecessors (S1), a
+          // verified record in each of them, and otherwise a record for every earlier
+          // tier of the current plan; else it is refused with promotion_prerequisite.
+          // Normal fan-out keeps its ordering by construction.
+          const stageOf = (plan,target) => plan.order.find(stage => plan[stage].includes(target));
+          const promotionName = (artifact,stage) => 'promotions/' + hash(artifact.artifact_digest) + '/stage/' + stage;
+          const verifiedName = (artifact,target) => 'promotions/' + hash(artifact.artifact_digest) + '/env/' + targetKey(target);
+          async function ensure(api,s,name,value) {
+            const old = await read(api,s,name,true);
+            if (old) return old;
+            try { return await put(api,s,name,value); }
+            catch (e) { const won = await read(api,s,name,true); if (won) return won; throw e; }
+          }
+          async function assertPromoted(api,s,plan,target,artifact,settings) {
+            if (await read(api,s,verifiedName(artifact,target),true)) return;
+            const predecessors = settings && settings[target] && settings[target].predecessors;
+            if (Array.isArray(predecessors)) {
+              for (const env of predecessors) if (!(await read(api,s,verifiedName(artifact,env),true))) fail('promotion_prerequisite');
+              return;
+            }
+            const stage = stageOf(plan,target);
+            for (const earlier of plan.order.slice(0, plan.order.indexOf(stage))) {
+              if (!(await read(api,s,promotionName(artifact,earlier),true))) fail('promotion_prerequisite');
+            }
+          }
+          // S3: the receipt is the proof; the promotion records derive from it, so a
+          // replay that finds a receipt rebuilds any record a crash left out.
+          async function recordPromotion(api,s,plan,target,value) {
+            const promotion={artifact_digest:value.artifact.artifact_digest,stage:stageOf(plan,target),environment:target,operation_id:value.operation_id,
+              run_id:value.run_id,run_attempt:value.run_attempt,commit:value.commit};
+            await ensure(api,s,promotionName(value.artifact,stageOf(plan,target)),promotion);
+            await ensure(api,s,verifiedName(value.artifact,target),promotion);
+          }
+          async function prepare(api,s,plan,target,selection,contract) {
+            if (!envOK(target) || (selection && selection !== target)) fail('target_scope');
+            const settings = await assertPlan(api,s,plan,target,contract);
+            const frozen = settings === undefined ? {} : {deploy_settings: canonical(settings[target])};
+            const record=await read(api,s,artifactName(s));if(!record)fail('artifact_missing');
+            const artifact=validateArtifact(record.value.artifact), id=operationId(s,target);
+            if (selection) await assertPromoted(api,s,plan,target,artifact,settings);
+            const receipt=await read(api,s,scopedName('receipts',s,target));
+            if(receipt){
+              if(receipt.value.operation_id!==id || canonical(receipt.value.artifact)!==canonical(artifact))fail('record_conflict');
+              await recordPromotion(api,s,plan,target,receipt.value);
+              const lock=await read(api,s,'target-locks/'+targetKey(target),true);
+              if(lock?.value.operation_id===id)await unlock(api,s,target,id);
+              return {deploy_required:false,artifact,operation_id:id,...frozen};
+            }
+            if(await read(api,s,scopedName('intents',s,target)))fail('deployment_uncertain');
+            const intent={...execution(s),environment:target,operation_id:id,artifact,plan_digest:hash(plan),
+              ...(settings === undefined ? {} : {settings_digest:hash(settings[target])})};
+            await put(api,s,'target-locks/'+targetKey(target),intent,true);
+            await put(api,s,scopedName('intents',s,target),intent);
+            return {deploy_required:true,artifact,operation_id:id,...frozen};
+          }
+          async function complete(api,s,plan,target,observed,contract) {
+            const settings = await assertPlan(api,s,plan,target,contract);
+            const intent=await read(api,s,scopedName('intents',s,target));
+            const lock=await read(api,s,'target-locks/'+targetKey(target),true);
+            if(!intent || !lock || lock.value.operation_id!==intent.value.operation_id)fail('target_owner_changed');
+            const value=intent.value;
+            if(settings !== undefined && value.settings_digest !== hash(settings[target]))fail('settings_drift');
+            if(observed?.operation_id!==value.operation_id || observed.environment!==target ||
+                observed.observed_artifact_digest!==value.artifact.artifact_digest)fail('deployment_verification');
+            await put(api,s,scopedName('receipts',s,target),{...value,observed_artifact_digest:observed.observed_artifact_digest});
+            await recordPromotion(api,s,plan,target,value);
+            await unlock(api,s,target,value.operation_id);
+            return value;
+          }
+          async function main({github,context,core},phase) {
+            const e=process.env;
+            const workflow=(e.GITHUB_WORKFLOW_REF||'').slice((e.GITHUB_REPOSITORY||'').length+1).split('@')[0];
+            const s={repository:e.GITHUB_REPOSITORY,repository_id:String(context.payload.repository.id),workflow_path:workflow,commit:e.GITHUB_SHA,run_id:e.GITHUB_RUN_ID,run_attempt:Number(e.GITHUB_RUN_ATTEMPT)};
+            const api=async(method,url,body)=> (await github.request(method+' '+url,{...body,request:{timeout:10000}})).data;
+            let p;try{p=JSON.parse(e.CATALOG_PLAN);}catch{fail('plan_invalid');}
+            const target=e.TARGET_ENVIRONMENT||'',selection=e.SELECTED_ENVIRONMENT||'';
+            let contract;
+            if(e.DEPLOY_SETTINGS_KEYS){try{contract={keys:JSON.parse(e.DEPLOY_SETTINGS_KEYS),settings:JSON.parse(e.DEPLOY_SETTINGS||'null')};}catch{fail('settings_invalid');}}
+            let result;
+            if(phase==='resolve')result=await resolve(api,s,p,selection,contract);
+            else if(phase==='publish'){
+              const artifact=JSON.parse(require('node:fs').readFileSync(e.RESULT_FILE,'utf8'));
+              result={artifact:await publish(api,s,artifact)};
+            } else if(phase==='prepare')result=await prepare(api,s,p,target,selection,contract);
+            else if(phase==='complete'){
+              const observed=JSON.parse(require('node:fs').readFileSync(e.RESULT_FILE,'utf8'));
+              result=await complete(api,s,p,target,observed,contract);
+            } else fail('phase_invalid');
+            for(const [key,value]of Object.entries(result||{}))core.setOutput(key,typeof value==='object'?canonical(value):String(value));
+            if(result.artifact)for(const [key,value]of Object.entries(result.artifact))core.setOutput(key,value);
+          }
+          module.exports={canonical,hash,validatePlan,validateArtifact,validateContract,resolve,publish,prepare,complete,main};
+
+          })(loaded);
+          await loaded.exports.main({github, context, core}, 'prepare');
+        retries: 0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      if: ${{ steps.prepare.outputs.deploy_required == 'true' }}
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Deploy pinned artifact and independently inspect target
+      if: ${{ steps.prepare.outputs.deploy_required == 'true' }}
+      shell: bash
+      env:
+        RESULT_FILE: ${{ runner.temp }}/helio-deploy-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.environment }}.json
+        ADAPTER: ${{ inputs.deploy_adapter }}
+        ARTIFACT_URI: ${{ steps.prepare.outputs.artifact_uri }}
+        ARTIFACT_DIGEST: ${{ steps.prepare.outputs.artifact_digest }}
+        BUILD_VERSION: ${{ steps.prepare.outputs.build_version }}
+        OPERATION_ID: ${{ steps.prepare.outputs.operation_id }}
+        HELIO_TARGET_SETTINGS: ${{ steps.prepare.outputs.deploy_settings }}
+        SECRET_NAMES: ${{ inputs.secret_names }}
+        HELIO_SECRETS_JSON: ${{ toJSON(secrets) }}
+      run: |
+        set -euo pipefail
+        [[ "$ADAPTER" =~ ^cicd/[A-Za-z0-9_-]+[.]sh$ ]]
+        test -f "$ADAPTER"
+        # Only the secrets the application declared reach the adapter process.
+        HELIO_SECRETS_JSON="$(python3 -c 'import json,os; names=json.loads(os.environ.get("SECRET_NAMES") or "[]"); s=json.loads(os.environ.get("HELIO_SECRETS_JSON") or "{}"); print(json.dumps({n: s[n] for n in names if n in s}))')"
+        export HELIO_SECRETS_JSON
+        rm -f -- "$RESULT_FILE"
+        bash "$ADAPTER"
+        test -s "$RESULT_FILE"
+    - name: Complete durable catalog state
+      id: complete
+      if: ${{ steps.prepare.outputs.deploy_required == 'true' }}
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+      env:
+        RESULT_FILE: ${{ runner.temp }}/helio-deploy-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.environment }}.json
+      with:
+        script: |
+          const loaded = {exports: {}};
+          (function(module) {
+          'use strict';
+          // Embedded verbatim in pinned reusable workflows by generate.py. No fetch/eval
+          // of runtime code, no secret data in durable records, no force-updated refs.
+          const crypto = require('node:crypto');
+          const fail = code => { throw Error('catalog_' + code); };
+          function canonical(x) {
+            if (Array.isArray(x)) return '[' + x.map(canonical).join(',') + ']';
+            if (x && typeof x === 'object') return '{' + Object.keys(x).sort().map(k => JSON.stringify(k) + ':' + canonical(x[k])).join(',') + '}';
+            return JSON.stringify(x);
+          }
+          const hash = x => crypto.createHash('sha256').update(canonical(x)).digest('hex');
+          const shaOK = x => typeof x === 'string' && /^[a-f0-9]{40}$/.test(x);
+          const envOK = x => typeof x === 'string' && /^[a-z0-9][a-z0-9._-]{0,62}$/.test(x) && !x.includes('..');
+          function scopeOK(s) {
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(s.repository || '') ||
+                !/^[1-9][0-9]{0,19}$/.test(s.repository_id || '') || !shaOK(s.commit) ||
+                !/^[1-9][0-9]{0,19}$/.test(s.run_id || '') || !/^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(s.workflow_path || '') ||
+                !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
+          }
+          function validatePlan(p, target) {
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
                 new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
                 canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
                 !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
@@ -693,8 +1309,8 @@ jobs:
                 !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
           }
           function validatePlan(p, target) {
-            const stages = ['qa','preprod','production'];
-            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
                 new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
                 canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
                 !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
@@ -1006,8 +1622,8 @@ jobs:
                 !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
           }
           function validatePlan(p, target) {
-            const stages = ['qa','preprod','production'];
-            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
                 new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
                 canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
                 !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
@@ -1309,8 +1925,8 @@ jobs:
                 !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
           }
           function validatePlan(p, target) {
-            const stages = ['qa','preprod','production'];
-            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
                 new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
                 canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
                 !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
@@ -1622,8 +2238,8 @@ jobs:
                 !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
           }
           function validatePlan(p, target) {
-            const stages = ['qa','preprod','production'];
-            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+            const stages = ['int','qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > stages.length ||
                 new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
                 canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
                 !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
